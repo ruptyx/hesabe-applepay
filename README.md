@@ -6,6 +6,7 @@ borderless `WKWebView` that contains only the Apple Pay button. Everything else 
 native, and the sheet the customer sees is the real system Apple Pay sheet.
 
 The backend examples use [hesabe-node](https://github.com/ruptyx/hesabe-node).
+[`demo/`](demo) is an Xcode project with the app code from Steps 6 to 8.
 
 ## Step 1. Enable Apple Pay on your Hesabe account
 
@@ -74,6 +75,7 @@ function applePayPage({ requestData, paymentType, environment, cancelUrl }) {
     -apple-pay-button-type: buy;
     -apple-pay-button-style: black;
   }
+  button[hidden] { display: none; }
   @media (prefers-color-scheme: dark) { button { -apple-pay-button-style: white; } }
 </style>
 </head>
@@ -104,7 +106,7 @@ Serve it from a route that creates a new Hesabe session for each attempt:
 
 ```ts
 import express from "express";
-import { Hesabe, HesabeError, isSuccessful } from "hesabe";
+import { Hesabe, HesabeError, isSuccessful, type TransactionRecord } from "hesabe";
 
 const app = express();
 const hesabe = new Hesabe();
@@ -128,15 +130,22 @@ app.get("/pay/apple-pay/button/:orderId", async (req, res) => {
   // session.data is base64 JSON; the Apple Pay SDK wants only its inner `data`.
   const { data: requestData } = JSON.parse(Buffer.from(session.data, "base64").toString());
 
-  res.set("Cache-Control", "no-store").type("html").send(applePayPage({
+  res.set({
+    "Cache-Control": "no-store",
+    // The app asks the done route with this if Hesabe's redirect never arrives.
+    "X-Payment-Reference": reference,
+  });
+  res.type("html").send(applePayPage({
     requestData,
     paymentType: APPLE_PAY_TYPE,
-    environment: process.env.HESABE_ENVIRONMENT,
+    environment: hesabe.environment, // the same environment the session was created in
     cancelUrl: `${BASE}/cancelled`,
   }));
 });
 ```
 
+- The `X-Payment-Reference` header lets the app find the attempt if Hesabe's redirect
+  never arrives (Step 6).
 - Protect this route like any other order endpoint, for example with a short-lived
   signed token in the URL. Anyone with the URL can create a session for the order.
 - If your site sends a `Content-Security-Policy`, allow `https://unpkg.com` and
@@ -144,46 +153,79 @@ app.get("/pay/apple-pay/button/:orderId", async (req, res) => {
 
 ## Step 5. Add the result route
 
-The page navigates here after the sheet closes. The route looks up the reference in
-the path, so it never trusts anything the device carried back.
+After the sheet, Hesabe redirects the page here. The app stops that navigation and
+asks this route itself. It looks up the reference in the path, so it never trusts
+anything the device carried back.
 
 ```ts
 app.get("/pay/apple-pay/done/:reference", async (req, res) => {
-  let transaction = null;
+  const { reference } = req.params;
+  let transaction: TransactionRecord | null = null;
   try {
-    transaction = await hesabe.transactions.retrieveByOrderReference(req.params.reference);
+    transaction = await hesabe.transactions.retrieveByOrderReference(reference);
   } catch (error) {
     // 404: no payment reached the gateway (cancelled, or rejected before charging)
     if (!(error instanceof HesabeError) || error.statusCode !== 404) throw error;
   }
 
-  const paid = transaction !== null && isSuccessful(transaction);
-  if (paid) await fulfil(req.params.reference); // idempotent: the webhook may get there first
-  res.set("Cache-Control", "no-store").json({ paid, reference: req.params.reference, transaction });
+  const status = paymentStatus(transaction);
+  if (status === "paid") await fulfil(reference); // idempotent: the webhook may get there first
+  res.set("Cache-Control", "no-store").json({ status, reference });
 });
+
+/** "paid", "failed", or "pending" while Hesabe is still settling it. */
+function paymentStatus(transaction: TransactionRecord | null) {
+  if (transaction === null) return "failed";
+  if (isSuccessful(transaction)) return "paid";
+  if (transaction.status.trim().toUpperCase() === "FAILED") return "failed";
+  return "pending";
+}
 ```
 
+- A payment that is still settling answers `pending`. The app asks again for about 30
+  seconds, then leaves it to your webhook (see the hesabe-node README).
 - Don't use `verifyRedirect` here. The Apple Pay redirect has no `paymentToken`, so it
   throws even when the payment succeeded.
-- Also handle the webhook from the hesabe-node README as a backup.
 
-## Step 6. Add the button view
+## Step 6. Add the web view
 
-A `WKWebView` that loads the button page and stops the navigation to the done or
-cancelled URL.
+A `WKWebView` that loads the button page and reports what happens in it: the button
+is ready, Hesabe is charging, the attempt ended, the customer cancelled, or the page
+failed to load. It learns this from navigations and responses only, because running
+script in the page disables Apple Pay.
+
+Set `applePayBase` to your backend's routes from Steps 4 and 5.
 
 ```swift
 import SwiftUI
 import WebKit
 
-let applePayBase = "https://yourshop.com/pay/apple-pay"
+/// Your backend's Apple Pay routes (Steps 4 and 5), on the domain Hesabe registered.
+let applePayBase = URL(string: "https://yourshop.com/pay/apple-pay")!
 
-struct ApplePayButton: UIViewRepresentable {
+/// What the button page did. The app learns this from navigations and responses only:
+/// running script in the page would disable Apple Pay.
+enum ApplePayEvent {
+    /// The button page loaded and the button is showing.
+    case ready
+    /// The customer approved the sheet and the page left for Hesabe to charge.
+    case processing
+    /// The attempt ended. Ask this done URL how it went.
+    case finished(URL)
+    /// Hesabe may have charged the card, but the page failed before saying which attempt.
+    case unconfirmed
+    /// The customer closed the sheet without paying.
+    case cancelled
+    /// The button page didn't load. Nothing was charged.
+    case failed
+}
+
+/// A web view that shows only the button page and reports what happens in it.
+struct ApplePayWebView: UIViewRepresentable {
     let orderID: String
-    /// The done URL to confirm with your backend, or nil when the customer cancelled.
-    var onFinish: (URL?) -> Void
+    var onEvent: (ApplePayEvent) -> Void
 
-    func makeCoordinator() -> Coordinator { Coordinator(onFinish: onFinish) }
+    func makeCoordinator() -> Coordinator { Coordinator(onEvent: onEvent) }
 
     func makeUIView(context: Context) -> WKWebView {
         // Never add a WKUserScript or call evaluateJavaScript on this web view:
@@ -197,17 +239,22 @@ struct ApplePayButton: UIViewRepresentable {
         #if DEBUG
         if #available(iOS 16.4, *) { webView.isInspectable = true }
         #endif
-        webView.load(URLRequest(url: URL(string: "\(applePayBase)/button/\(orderID)")!))
+        webView.load(URLRequest(url: applePayBase.appending(path: "button/\(orderID)")))
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        context.coordinator.onFinish = onFinish
+        context.coordinator.onEvent = onEvent
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
-        var onFinish: (URL?) -> Void
-        init(onFinish: @escaping (URL?) -> Void) { self.onFinish = onFinish }
+        var onEvent: (ApplePayEvent) -> Void
+        private var reference: String? // this attempt's, from the button page's response
+        private var shown = false       // the button page finished loading
+        private var charging = false    // the page left for Hesabe after the sheet
+        private var ended = false
+
+        init(onEvent: @escaping (ApplePayEvent) -> Void) { self.onEvent = onEvent }
 
         func webView(_ webView: WKWebView,
                      decidePolicyFor action: WKNavigationAction,
@@ -215,69 +262,263 @@ struct ApplePayButton: UIViewRepresentable {
             guard action.targetFrame?.isMainFrame != false,
                   let url = action.request.url else { return decisionHandler(.allow) }
 
-            if url.absoluteString.hasPrefix("\(applePayBase)/done/") {
+            if url.absoluteString.hasPrefix(applePayBase.appending(path: "done/").absoluteString) {
+                end(.finished(url))
                 decisionHandler(.cancel)
-                onFinish(url)
-            } else if url.absoluteString.hasPrefix("\(applePayBase)/cancelled") {
+            } else if url.absoluteString.hasPrefix(applePayBase.appending(path: "cancelled").absoluteString) {
+                end(.cancelled)
                 decisionHandler(.cancel)
-                onFinish(nil)
+            } else {
+                // Anything after the button page is Hesabe charging the card. The view
+                // hides the web view from here on, so Hesabe's pages never show in the slot.
+                if shown && !charging {
+                    charging = true
+                    onEvent(.processing)
+                }
+                decisionHandler(.allow)
+            }
+        }
+
+        func webView(_ webView: WKWebView,
+                     decidePolicyFor response: WKNavigationResponse,
+                     decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+            guard response.isForMainFrame,
+                  let http = response.response as? HTTPURLResponse else { return decisionHandler(.allow) }
+
+            if !shown {
+                reference = http.value(forHTTPHeaderField: "X-Payment-Reference")
+            }
+            if http.statusCode >= 400 {
+                loadFailed()
+                decisionHandler(.cancel)
             } else {
                 decisionHandler(.allow)
             }
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            if !shown && !ended {
+                shown = true
+                onEvent(.ready)
+            }
+        }
+
+        func webView(_ webView: WKWebView,
+                     didFailProvisionalNavigation navigation: WKNavigation!,
+                     withError error: Error) {
+            loadFailed(error)
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            loadFailed(error)
+        }
+
+        private func loadFailed(_ error: Error? = nil) {
+            // A newer navigation replacing this one also reports as a failure.
+            if let error = error as? URLError, error.code == .cancelled { return }
+
+            if !charging {
+                end(.failed)
+            } else if let reference {
+                // The card may have been charged but Hesabe's redirect never arrived:
+                // ask the done route directly.
+                end(.finished(applePayBase.appending(path: "done/\(reference)")))
+            } else {
+                end(.unconfirmed)
+            }
+        }
+
+        private func end(_ event: ApplePayEvent) {
+            guard !ended else { return }
+            ended = true
+            onEvent(event)
         }
     }
 }
 ```
 
-## Step 7. Use it in your checkout
+## Step 7. Wrap it in a native button view
+
+After the sheet, the page goes to `api.hesabe.com` before it redirects. The view hides
+the web view from then on and shows a native "Confirming payment…" state, so Hesabe's
+pages never appear in the button's frame. It shows a spinner while the page loads, and
+a retry button if the page fails.
 
 ```swift
-struct ApplePayResult: Decodable {
-    let paid: Bool
-    let reference: String
+import SwiftUI
+
+/// How one Apple Pay attempt ended, as the app shows it.
+enum PaymentOutcome: Equatable {
+    case paid
+    /// Declined or rejected. Nothing was charged.
+    case failed
+    /// Hesabe is still settling it. Your webhook finishes the order.
+    case pending
+    /// The app couldn't find out. The card may have been charged.
+    case unconfirmed
+    case cancelled
+
+    /// Whether the customer can safely pay again.
+    var canRetry: Bool { self == .failed || self == .cancelled }
+
+    var message: String {
+        switch self {
+        case .paid: "Paid. Thank you!"
+        case .failed: "The payment didn't go through. You weren't charged."
+        case .pending: "Your payment is still processing. We'll update your order when it completes."
+        case .unconfirmed: "We couldn't confirm your payment. Check your order before paying again."
+        case .cancelled: "Payment cancelled."
+        }
+    }
 }
 
-struct CheckoutView: View {
+/// The Apple Pay button in a native frame: a spinner while the page loads, a retry button
+/// if it doesn't, and a native "Confirming" state while Hesabe charges the card.
+struct ApplePayButton: View {
     let orderID: String
+    var onOutcome: (PaymentOutcome) -> Void
+
+    private enum Phase { case loading, ready, charging, failed }
+
     @State private var attempt = 0
-    @State private var status: String?
+    @State private var phase = Phase.loading
 
     var body: some View {
-        VStack(spacing: 16) {
-            // … your native order summary …
+        ZStack {
+            ApplePayWebView(orderID: orderID, onEvent: handle)
+                .id(attempt) // new web view = new Hesabe session; each one is single use
+                // Keep the web view loading, but only ever show the button page.
+                .opacity(phase == .ready ? 1 : 0)
+                .allowsHitTesting(phase == .ready)
 
-            ApplePayButton(orderID: orderID) { doneURL in
-                attempt += 1 // new identity = new web view = new Hesabe session
-                guard let doneURL else { return }
-                Task { status = await confirm(doneURL) }
+            switch phase {
+            case .loading:
+                ProgressView()
+            case .charging:
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("Confirming payment…")
+                }
+            case .failed:
+                Button("Couldn't load Apple Pay. Try again", action: reload)
+            case .ready:
+                EmptyView()
             }
-            .id(attempt)
-            .frame(height: 50)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-
-            if let status { Text(status) }
         }
-        .padding()
+        .frame(height: 50)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    func confirm(_ url: URL) async -> String {
-        guard let (data, _) = try? await URLSession.shared.data(from: url),
-              let result = try? JSONDecoder().decode(ApplePayResult.self, from: data)
-        else { return "Couldn't confirm the payment" }
-        return result.paid ? "Paid" : "Payment didn't go through"
+    private func handle(_ event: ApplePayEvent) {
+        switch event {
+        case .ready:
+            phase = .ready
+        case .processing:
+            phase = .charging
+        case .failed:
+            phase = .failed
+        case .cancelled:
+            onOutcome(.cancelled)
+            reload()
+        case .unconfirmed:
+            onOutcome(.unconfirmed)
+        case .finished(let doneURL):
+            phase = .charging
+            Task {
+                let outcome = await confirmPayment(at: doneURL)
+                onOutcome(outcome)
+                if outcome.canRetry { reload() }
+            }
+        }
     }
+
+    private func reload() {
+        phase = .loading
+        attempt += 1
+    }
+}
+
+/// Asks the done route (Step 5) how the attempt ended. A payment still settling reports
+/// "pending", so ask again for a while before handing it to the webhook.
+func confirmPayment(at url: URL) async -> PaymentOutcome {
+    struct Reply: Decodable { let status: String }
+
+    var sawPending = false
+    for attempt in 0..<10 {
+        if attempt > 0 { try? await Task.sleep(for: .seconds(3)) }
+        guard let (data, response) = try? await URLSession.shared.data(from: url),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let reply = try? JSONDecoder().decode(Reply.self, from: data)
+        else { continue }
+
+        switch reply.status {
+        case "paid": return .paid
+        case "failed": return .failed
+        default: sawPending = true
+        }
+    }
+    return sawPending ? .pending : .unconfirmed
 }
 ```
 
 - Always show the result from the done route. The Apple Pay sheet says "Done" even
   when the payment is declined.
-- Each Hesabe session is single use, so the view gets a new `id` after every attempt.
-- Hide the button for orders below the Apple Pay minimum. Hesabe sets it per method
-  (KNET debit rejected 0.100 KWD and accepted 0.250 KWD).
+- Each Hesabe session is single use, so the view loads a new web view after every
+  attempt the customer can retry.
 
-## Step 8. Test on a real iPhone
+## Step 8. Use it in your checkout
 
-Apple Pay needs a real device with a card in Wallet.
+```swift
+import PassKit
+import SwiftUI
+
+struct CheckoutView: View {
+    /// An order your backend knows, at or above the Apple Pay minimum.
+    let orderID = "ORDER-1001"
+    /// Display only: the backend charges the order's own total.
+    let total = "1.000 KWD"
+
+    @State private var outcome: PaymentOutcome?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    LabeledContent("Test item", value: total)
+                    LabeledContent("Total", value: total)
+                        .fontWeight(.semibold)
+                }
+
+                Section {
+                    if !PKPaymentAuthorizationController.canMakePayments() {
+                        Text("Apple Pay isn't available on this device.")
+                    } else if outcome?.canRetry ?? true {
+                        ApplePayButton(orderID: orderID) { outcome = $0 }
+                            .listRowInsets(EdgeInsets())
+                            .listRowBackground(Color.clear)
+                    }
+                } footer: {
+                    if let outcome { Text(outcome.message) }
+                }
+            }
+            .navigationTitle("Checkout")
+        }
+    }
+}
+
+#Preview {
+    CheckoutView()
+}
+```
+
+Hide the button for orders below the Apple Pay minimum. Hesabe sets it per method (KNET
+debit rejected 0.100 KWD and accepted 0.250 KWD).
+
+## Step 9. Test on a real iPhone
+
+Apple Pay needs a real device with a card in Wallet. To run the demo, open
+`demo/ApplePayDemo.xcodeproj` in Xcode 16 or later, set `applePayBase` and `orderID`,
+choose your team under Signing & Capabilities, and run it on your iPhone.
 
 - In Debug builds, inspect the page from a Mac: Safari → Develop → your iPhone.
 - If the sheet shows "Payment Not Completed" without asking the customer to confirm,
