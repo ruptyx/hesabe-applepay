@@ -1,100 +1,62 @@
-# Apple Pay in native apps
+# Apple Pay in SwiftUI with Hesabe
 
-Hesabe Apple Pay inside a React Native or SwiftUI app, using your own button and the
-system Apple Pay sheet. Backend examples use the Hesabe SDKs:
-[hesabe-node](https://github.com/ruptyx/hesabe-node) and
-[hesabe-python](https://github.com/ruptyx/hesabe-python).
+Hesabe validates Apple Pay merchants against a domain it registered with Apple, so the
+payment has to start from a page on that domain. The app shows that page in a
+borderless `WKWebView` that contains only the Apple Pay button. Everything else stays
+native, and the sheet the customer sees is the real system Apple Pay sheet.
 
-Hesabe does not document in-app Apple Pay through PassKit. Apple Pay goes through the
-web: Hesabe validates the merchant against a domain it registered with Apple, so the
-payment has to start from a page on that domain. The app shows that page as a
-borderless WebView containing only the Apple Pay button. The sheet the customer sees
-is the real system sheet either way.
+The backend examples use [hesabe-node](https://github.com/ruptyx/hesabe-node).
+
+## Step 1. Enable Apple Pay on your Hesabe account
+
+Email support@hesabe.com and ask them to enable Apple Pay for your merchant account.
+
+## Step 2. Register your domain
+
+Email itsupport@hesabe.com with the domain that will serve the button page. Hesabe
+sends back a domain association file. Serve it as plain text at:
 
 ```
-App screen (native)                 Your backend                      Hesabe
-───────────────────                 ────────────                      ──────
-WebView ── GET /pay/apple-pay/button/ORDER-1001 ──▶ checkout.create ──▶ session
-        ◀── page with a single Apple Pay button ────
-tap ──────────────────── Apple Pay sheet ──────────────────────────▶ validate + charge
-        ◀── navigates to /pay/apple-pay/done/ORDER-1001-… ◀──────── redirect
-app stops that navigation ── GET …/done/… ─▶ transactions.retrieveByOrderReference
-        ◀── { paid, reference, transaction } ──
+https://yourshop.com/.well-known/apple-developer-merchantid-domain-association.txt
 ```
 
-## Demo app
+Tell Hesabe only after the file is live. Apple checks it when Hesabe presses verify,
+and a verification that ran before the file was reachable fails without telling you.
 
-[`demo/`](demo) is an Expo SDK 54 app with a native checkout screen and the Apple
-Pay button from [React Native](#react-native). It runs in Expo Go. It needs a backend
-serving the routes from [Backend](#backend) on your Hesabe-registered domain.
+## Step 3. Find your Apple Pay payment type
 
-1. Set `BASE` in [`demo/components/ApplePayButton.tsx`](demo/components/ApplePayButton.tsx)
-   to your backend's Apple Pay routes.
-2. Set `ORDER` in [`demo/App.tsx`](demo/App.tsx) to an order your backend knows,
-   at or above the Apple Pay minimum (see [Behavior worth knowing](#behavior-worth-knowing)).
-3. Run it:
+Each merchant has its own set. The checkout-details endpoint lists them:
 
-   ```bash
-   cd demo
-   npm install
-   npx expo start
-   ```
+```ts
+const session = await hesabe.checkout.create({ embedded: true, amount: 1, /* … */ });
+const { data } = JSON.parse(Buffer.from(session.data, "base64").toString());
+const details = await fetch(`https://api.hesabe.com/api/checkout-details?data=${data}`)
+  .then((r) => r.json());
 
-   Scan the QR code with an iPhone camera to open it in Expo Go. Use
-   `npx expo start --tunnel` if the phone isn't on the same network. Apple Pay needs
-   a real iPhone with a card in Wallet.
+details.response.applePay.map((method) => method.id); // e.g. [11, 13]
+```
 
-## Before you start
+| Type | Apple Pay method |
+|---|---|
+| `9` | MPGS |
+| `10` | CyberSource |
+| `11` | KNET debit (Kuwait-issued debit cards) |
+| `12` | KNET credit |
+| `13` | KNET international (other cards) |
+| `14` | American Express |
 
-1. **Enable Apple Pay on your merchant account.** Email support@hesabe.com.
-2. **Register your domain.** Email itsupport@hesabe.com with the domain that will serve
-   the button page. Hesabe sends back a domain association file. Serve it as plain text at:
+One button starts one type. If you have both 11 and 13, pick one or show two buttons.
 
-   ```
-   https://yourshop.com/.well-known/apple-developer-merchantid-domain-association.txt
-   ```
+## Step 4. Serve the button page
 
-   Only tell Hesabe once the file is live. Apple checks the file when Hesabe presses
-   verify, so a verification run before the file was reachable fails. Nothing tells you
-   it failed.
-3. **Find your Apple Pay payment types.** Each merchant has its own set. Hesabe's
-   checkout-details endpoint lists them, and needs no access code:
-
-   ```ts
-   const session = await hesabe.checkout.create({ embedded: true, amount: 1, /* … */ });
-   const { data } = JSON.parse(Buffer.from(session.data, "base64").toString());
-   const details = await fetch(`https://api.hesabe.com/api/checkout-details?data=${data}`)
-     .then((r) => r.json());
-
-   details.response.applePay.map((method) => method.id); // e.g. [11, 13]
-   ```
-
-| Type | Apple Pay method | Notes |
-|---|---|---|
-| `9` | MPGS | |
-| `10` | CyberSource | |
-| `11` | KNET debit | Kuwait-issued debit cards; shown as "Apple Pay (KNET)" in Hesabe's checkout |
-| `12` | KNET credit | |
-| `13` | KNET international | Other cards; shown as "Apple Pay" in Hesabe's checkout |
-| `14` | American Express | |
-
-One button starts one type. With both 11 and 13 enabled, either choose the one your
-customers use most, or show two buttons.
-
-## Backend
-
-Three things: a route that serves the button page, a route the app asks for the
-result, and the webhook from the SDK README as a backup.
-
-The button page loads Hesabe's `direct-apple-pay` browser SDK and draws WebKit's
-built-in Apple Pay button. Pin the version; `@latest` can change a payment page
-without warning.
+This HTML page loads Hesabe's `direct-apple-pay` browser SDK and draws WebKit's
+built-in Apple Pay button. Pin the SDK version.
 
 ```js
 const APPLE_PAY_SDK =
   "https://unpkg.com/@hesabe-pay/direct-apple-pay@1.0.15/cdn/hesabe-apple-pay.min.js";
 
-/** HTML with nothing but a system Apple Pay button, sized by the WebView around it. */
+/** HTML with nothing but a system Apple Pay button, sized by the web view around it. */
 function applePayPage({ requestData, paymentType, environment, cancelUrl }) {
   const config = JSON.stringify({ requestData, environment, paymentType, cancelUrl })
     .replace(/</g, "\\u003c");
@@ -138,15 +100,16 @@ function applePayPage({ requestData, paymentType, environment, cancelUrl }) {
 }
 ```
 
-### Node
+Serve it from a route that creates a new Hesabe session for each attempt:
 
 ```ts
 import express from "express";
 import { Hesabe, HesabeError, isSuccessful } from "hesabe";
 
+const app = express();
 const hesabe = new Hesabe();
 const BASE = "https://yourshop.com/pay/apple-pay";
-const APPLE_PAY_TYPE = 11; // from checkout-details, see "Before you start"
+const APPLE_PAY_TYPE = 11; // from Step 3
 
 app.get("/pay/apple-pay/button/:orderId", async (req, res) => {
   const order = await loadOrder(req.params.orderId); // amount from your database, never the app
@@ -172,7 +135,19 @@ app.get("/pay/apple-pay/button/:orderId", async (req, res) => {
     cancelUrl: `${BASE}/cancelled`,
   }));
 });
+```
 
+- Protect this route like any other order endpoint, for example with a short-lived
+  signed token in the URL. Anyone with the URL can create a session for the order.
+- If your site sends a `Content-Security-Policy`, allow `https://unpkg.com` and
+  `https://api.hesabe.com`.
+
+## Step 5. Add the result route
+
+The page navigates here after the sheet closes. The route looks up the reference in
+the path, so it never trusts anything the device carried back.
+
+```ts
 app.get("/pay/apple-pay/done/:reference", async (req, res) => {
   let transaction = null;
   try {
@@ -188,174 +163,14 @@ app.get("/pay/apple-pay/done/:reference", async (req, res) => {
 });
 ```
 
-### Python
+- Don't use `verifyRedirect` here. The Apple Pay redirect has no `paymentToken`, so it
+  throws even when the payment succeeded.
+- Also handle the webhook from the hesabe-node README as a backup.
 
-```python
-import base64
-import json
-import os
-import time
+## Step 6. Add the button view
 
-from flask import jsonify
-from hesabe import Hesabe, HesabeError, is_successful
-
-hesabe = Hesabe()
-BASE = "https://yourshop.com/pay/apple-pay"
-APPLE_PAY_TYPE = 11
-
-
-@app.get("/pay/apple-pay/button/<order_id>")
-def apple_pay_button(order_id):
-    order = load_order(order_id)
-    reference = f"{order.id}-{int(time.time() * 1000)}"
-    record_attempt(order.id, reference)
-
-    session = hesabe.checkout.create(
-        amount=order.total,
-        order_reference_number=reference,
-        response_url=f"{BASE}/done/{reference}",
-        failure_url=f"{BASE}/done/{reference}",
-        webhook_url="https://yourshop.com/hesabe/webhook",
-        embedded=True,
-    )
-
-    wrapped = session["data"]
-    request_data = json.loads(base64.b64decode(wrapped + "=" * (-len(wrapped) % 4)))["data"]
-
-    html = apple_pay_page(
-        request_data=request_data,
-        payment_type=APPLE_PAY_TYPE,
-        environment=os.environ["HESABE_ENVIRONMENT"],
-        cancel_url=f"{BASE}/cancelled",
-    )
-    return html, {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}
-
-
-@app.get("/pay/apple-pay/done/<reference>")
-def apple_pay_done(reference):
-    try:
-        transaction = hesabe.transactions.retrieve_by_order_reference(reference)
-    except HesabeError as exc:
-        if exc.status_code != 404:
-            raise
-        transaction = None
-
-    paid = transaction is not None and is_successful(transaction)
-    if paid:
-        fulfil(reference)
-    return jsonify(paid=paid, reference=reference, transaction=transaction)
-```
-
-`apple_pay_page` is the same HTML template as above.
-
-The done route confirms the payment by looking up the reference in the URL's path, so
-it never trusts anything the customer's device carried back. Don't use
-`verifyRedirect` here. The Apple Pay SDK's redirect payload has no `paymentToken`, so
-`verifyRedirect` throws `Redirect payload has no payment token` even when the payment
-succeeded.
-
-**Protect the button route like any other order endpoint.** Anyone who has the URL can
-create a checkout session for that order. A short-lived signed token in the path or
-query works for both apps. React Native can also send headers on the first request.
-
-If your site sends a `Content-Security-Policy` with `script-src` or `connect-src`,
-allow `https://unpkg.com` (the SDK) and `https://api.hesabe.com` (the SDK calls it
-for checkout details, merchant validation and the result).
-
-## React Native
-
-```bash
-npx expo install react-native-webview
-```
-
-Works in Expo Go and in development builds; tested on Expo SDK 54 with
-`react-native-webview` 13.15.0. A runnable version is in [`demo/`](demo).
-
-```tsx
-import { useState } from "react";
-import { Platform, StyleSheet, View } from "react-native";
-import { WebView } from "react-native-webview";
-
-// Your backend's Apple Pay routes: see "Backend" in the README.
-// Must be on the domain Hesabe registered with Apple for your merchant.
-const BASE = "https://yourshop.com/pay/apple-pay";
-
-export type ApplePayResult = { paid: boolean; cancelled?: boolean; reference?: string };
-
-export function ApplePayButton({
-  orderId,
-  onResult,
-}: {
-  orderId: string;
-  onResult: (result: ApplePayResult) => void;
-}) {
-  const [attempt, setAttempt] = useState(0); // new key = new WebView = new Hesabe session
-
-  if (Platform.OS !== "ios") return null;
-
-  function intercept(url: string) {
-    if (url.startsWith(`${BASE}/done/`)) {
-      fetch(url)
-        .then((res) => res.json())
-        .then(onResult)
-        .catch(() => onResult({ paid: false }));
-    } else if (url.startsWith(`${BASE}/cancelled`)) {
-      onResult({ paid: false, cancelled: true });
-    } else {
-      return true;
-    }
-    setAttempt((n) => n + 1);
-    return false;
-  }
-
-  return (
-    <View style={styles.button}>
-      <WebView
-        key={attempt}
-        source={{ uri: `${BASE}/button/${orderId}` }}
-        // Apple Pay only works in a WKWebView with no injected scripts;
-        // this also disables injectedJavaScript and postMessage.
-        enableApplePay
-        webviewDebuggingEnabled={__DEV__}
-        scrollEnabled={false}
-        style={styles.transparent}
-        containerStyle={styles.transparent}
-        onShouldStartLoadWithRequest={(req) => req.isTopFrame === false || intercept(req.url)}
-      />
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  button: { height: 50, borderRadius: 8, overflow: "hidden" },
-  transparent: { backgroundColor: "transparent" },
-});
-```
-
-```tsx
-<ApplePayButton
-  orderId={order.id}
-  onResult={(result) => {
-    if (result.paid) navigation.replace("OrderConfirmed", { orderId: order.id });
-    else if (!result.cancelled) showError("Payment didn't go through");
-  }}
-/>
-```
-
-`enableApplePay` is required. WebKit turns Apple Pay off for any page with injected
-JavaScript, so this prop also disables `injectedJavaScript`, `injectJavaScript()`,
-`injectedJavaScriptBeforeContentLoaded`, `sharedCookiesEnabled` and the HTML5 history
-shim. The app therefore finds out what happened from the URLs the page navigates to,
-not from `postMessage`. `onShouldStartLoadWithRequest` is native and keeps working.
-
-`webviewDebuggingEnabled={__DEV__}` lets you read Hesabe's logs during development:
-open Safari → Develop → your iPhone on a Mac.
-
-## SwiftUI
-
-The same rules apply: no scripts injected into the web view, and find out the result
-from navigations. `react-native-webview` with `enableApplePay` is this exact
-WKWebView setup.
+A `WKWebView` that loads the button page and stops the navigation to the done or
+cancelled URL.
 
 ```swift
 import SwiftUI
@@ -414,6 +229,8 @@ struct ApplePayButton: UIViewRepresentable {
 }
 ```
 
+## Step 7. Use it in your checkout
+
 ```swift
 struct ApplePayResult: Decodable {
     let paid: Bool
@@ -452,31 +269,17 @@ struct CheckoutView: View {
 }
 ```
 
-## Behavior worth knowing
+- Always show the result from the done route. The Apple Pay sheet says "Done" even
+  when the payment is declined.
+- Each Hesabe session is single use, so the view gets a new `id` after every attempt.
+- Hide the button for orders below the Apple Pay minimum. Hesabe sets it per method
+  (KNET debit rejected 0.100 KWD and accepted 0.250 KWD).
 
-Probed on production (September 2026, merchant with Apple Pay types 11 and 13).
-Hesabe's docs cover none of it.
+## Step 8. Test on a real iPhone
 
-- **The sheet always says "Done".** The SDK reports success to Apple Pay before
-  Hesabe returns the result. The customer sees a checkmark even for a declined
-  payment, so the app must show its own result from the done route.
-- **`session.data` is a wrapper.** It is base64 JSON:
-  `{ data, token, session_id, track_id, payment_types, amount }`. Hesabe's embedded
-  checkout unwraps it itself, but `direct-apple-pay` needs the inner `data`. Passing
-  the wrapper fails with `checkout-details` 400 `Failed to decrypt data parameter`.
-- **Apple Pay has a minimum amount.** Apple Pay KNET (type 11) rejected 0.100 KWD with
-  422 `Minimum amount error for chosen payment method, please try other payment
-  method` and accepted 0.250 KWD. The exact figure is set per method on Hesabe's side
-  and isn't published. Keep smaller orders off Apple Pay before you show the button.
-- **A missing domain registration looks like a card problem.** The sheet opens, then
-  shows "Payment Not Completed" without asking the customer to confirm. On a Mac,
-  Safari's Web Inspector shows the cause: merchant validation returns a ~145-byte
-  error body instead of a merchant session, and Wallet rejects it with `-25293`. Ask
-  Hesabe to run the domain verification again.
-- **The sheet shows your merchant code** ("Pay 842217") until Hesabe sets a display
-  name for your account.
-- **Tapping before `init()` finishes throws.** `init()` fetches the checkout details
-  and doesn't return a promise. A tap in the first few hundred milliseconds throws
-  `Token not available`; the next tap works.
-- **Each session is single use.** After a payment or cancel, load a new page, which
-  creates a new session. Both examples do this by changing the web view's `key` / `id`.
+Apple Pay needs a real device with a card in Wallet.
+
+- In Debug builds, inspect the page from a Mac: Safari → Develop → your iPhone.
+- If the sheet shows "Payment Not Completed" without asking the customer to confirm,
+  the domain registration from Step 2 is missing. Ask Hesabe to verify it again.
+- The sheet shows your merchant code ("Pay 842217") until Hesabe sets a display name.
