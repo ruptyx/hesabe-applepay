@@ -1,9 +1,6 @@
 import SwiftUI
 import WebKit
 
-/// Your backend's Apple Pay routes (Steps 4 and 5), on the domain Hesabe registered.
-let applePayBase = URL(string: "https://yourshop.com/pay/apple-pay")!
-
 /// What the button page did. The app learns this from navigations and responses only:
 /// running script in the page would disable Apple Pay.
 enum ApplePayEvent {

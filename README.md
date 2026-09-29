@@ -6,7 +6,8 @@ borderless `WKWebView` that contains only the Apple Pay button. Everything else 
 native, and the sheet the customer sees is the real system Apple Pay sheet.
 
 The backend examples use [hesabe-node](https://github.com/ruptyx/hesabe-node).
-[`demo/`](demo) is an Xcode project with the app code from Steps 6 to 8.
+[`demo/`](demo) is a complete Xcode project with the app code from Steps 6 to 8; only
+the backend URL and order ID are placeholders.
 
 ## Step 1. Enable Apple Pay on your Hesabe account
 
@@ -18,7 +19,7 @@ Email itsupport@hesabe.com with the domain that will serve the button page. Hesa
 sends back a domain association file. Serve it as plain text at:
 
 ```
-https://yourshop.com/.well-known/apple-developer-merchantid-domain-association.txt
+https://example.com/.well-known/apple-developer-merchantid-domain-association.txt
 ```
 
 Tell Hesabe only after the file is live. Apple checks it when Hesabe presses verify,
@@ -110,7 +111,7 @@ import { Hesabe, HesabeError, isSuccessful, type TransactionRecord } from "hesab
 
 const app = express();
 const hesabe = new Hesabe();
-const BASE = "https://yourshop.com/pay/apple-pay";
+const BASE = "https://example.com/pay/apple-pay";
 const APPLE_PAY_TYPE = 11; // from Step 3
 
 app.get("/pay/apple-pay/button/:orderId", async (req, res) => {
@@ -123,7 +124,7 @@ app.get("/pay/apple-pay/button/:orderId", async (req, res) => {
     orderReferenceNumber: reference,
     responseUrl: `${BASE}/done/${reference}`,
     failureUrl: `${BASE}/done/${reference}`,
-    webhookUrl: "https://yourshop.com/hesabe/webhook",
+    webhookUrl: "https://example.com/hesabe/webhook",
     embedded: true,
   });
 
@@ -194,14 +195,23 @@ is ready, Hesabe is charging, the attempt ended, the customer cancelled, or the 
 failed to load. It learns this from navigations and responses only, because running
 script in the page disables Apple Pay.
 
-Set `applePayBase` to your backend's routes from Steps 4 and 5.
+Put your backend's details in one place:
+
+```swift
+import Foundation
+
+// Replace these placeholders with your own values.
+
+/// Your backend's Apple Pay routes (Steps 4 and 5), on the domain Hesabe registered with Apple.
+let applePayBase = URL(string: "https://example.com/pay/apple-pay")!
+
+/// An order your backend knows, at or above the Apple Pay minimum.
+let checkoutOrderID = "ORDER-1001"
+```
 
 ```swift
 import SwiftUI
 import WebKit
-
-/// Your backend's Apple Pay routes (Steps 4 and 5), on the domain Hesabe registered.
-let applePayBase = URL(string: "https://yourshop.com/pay/apple-pay")!
 
 /// What the button page did. The app learns this from navigations and responses only:
 /// running script in the page would disable Apple Pay.
@@ -473,8 +483,6 @@ import PassKit
 import SwiftUI
 
 struct CheckoutView: View {
-    /// An order your backend knows, at or above the Apple Pay minimum.
-    let orderID = "ORDER-1001"
     /// Display only: the backend charges the order's own total.
     let total = "1.000 KWD"
 
@@ -493,7 +501,7 @@ struct CheckoutView: View {
                     if !PKPaymentAuthorizationController.canMakePayments() {
                         Text("Apple Pay isn't available on this device.")
                     } else if outcome?.canRetry ?? true {
-                        ApplePayButton(orderID: orderID) { outcome = $0 }
+                        ApplePayButton(orderID: checkoutOrderID) { outcome = $0 }
                             .listRowInsets(EdgeInsets())
                             .listRowBackground(Color.clear)
                     }
@@ -514,11 +522,17 @@ struct CheckoutView: View {
 Hide the button for orders below the Apple Pay minimum. Hesabe sets it per method (KNET
 debit rejected 0.100 KWD and accepted 0.250 KWD).
 
-## Step 9. Test on a real iPhone
+## Step 9. Run it
 
-Apple Pay needs a real device with a card in Wallet. To run the demo, open
-`demo/ApplePayDemo.xcodeproj` in Xcode 16 or later, set `applePayBase` and `orderID`,
-choose your team under Signing & Capabilities, and run it on your iPhone.
+1. Open `demo/ApplePayDemo.xcodeproj` in Xcode 16 or later.
+2. Replace the placeholders in `Config.swift` with your backend's Apple Pay URL and an
+   order it knows.
+3. Open `CheckoutView.swift` to see the checkout in the Xcode preview. The preview loads
+   your real button page, so each refresh creates a new Hesabe checkout session.
+4. To pay, choose your team under Signing & Capabilities and run it on an iPhone with a
+   card in Wallet. Payments don't complete in the preview or the simulator.
+
+If something goes wrong:
 
 - In Debug builds, inspect the page from a Mac: Safari → Develop → your iPhone.
 - If the sheet shows "Payment Not Completed" without asking the customer to confirm,
