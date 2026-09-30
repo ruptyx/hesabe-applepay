@@ -15,9 +15,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "A1B2C3D40000000000000006"
-               BuildableName = "ApplePayDemo.app"
-               BlueprintName = "ApplePayDemo"
-               ReferencedContainer = "container:ApplePayDemo.xcodeproj">
+               BuildableName = "HesabePay.app"
+               BlueprintName = "HesabePay"
+               ReferencedContainer = "container:HesabePay.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -43,9 +43,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A1B2C3D40000000000000006"
-            BuildableName = "ApplePayDemo.app"
-            BlueprintName = "ApplePayDemo"
-            ReferencedContainer = "container:ApplePayDemo.xcodeproj">
+            BuildableName = "HesabePay.app"
+            BlueprintName = "HesabePay"
+            ReferencedContainer = "container:HesabePay.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>

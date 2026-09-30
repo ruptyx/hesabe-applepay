@@ -12,7 +12,7 @@ jobs:
       - name: Build the demo app for the simulator
         run: >
           xcodebuild build
-          -project demo/ApplePayDemo.xcodeproj
-          -scheme ApplePayDemo
+          -project demo/HesabePay.xcodeproj
+          -scheme HesabePay
           -destination 'generic/platform=iOS Simulator'
           CODE_SIGNING_ALLOWED=NO
