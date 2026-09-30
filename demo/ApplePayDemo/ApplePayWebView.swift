@@ -8,10 +8,9 @@ enum ApplePayEvent {
     case ready
     /// The customer approved the sheet and the page left for Hesabe to charge.
     case processing
-    /// The attempt ended. Ask this done URL how it went.
-    case finished(URL)
-    /// Hesabe may have charged the card, but the page failed before saying which attempt.
-    case unconfirmed
+    /// The attempt ended. Ask Hesabe how it went. `hesabeFinished` is false when the
+    /// page failed mid-payment instead of coming back from Hesabe.
+    case finished(hesabeFinished: Bool)
     /// The customer closed the sheet without paying.
     case cancelled
     /// The button page didn't load. Nothing was charged.
@@ -20,10 +19,10 @@ enum ApplePayEvent {
 
 /// A web view that shows only the button page and reports what happens in it.
 struct ApplePayWebView: UIViewRepresentable {
-    let orderID: String
+    let attempt: ApplePayAttempt
     var onEvent: (ApplePayEvent) -> Void
 
-    func makeCoordinator() -> Coordinator { Coordinator(onEvent: onEvent) }
+    func makeCoordinator() -> Coordinator { Coordinator(attempt: attempt, onEvent: onEvent) }
 
     func makeUIView(context: Context) -> WKWebView {
         // Never add a WKUserScript or call evaluateJavaScript on this web view:
@@ -37,7 +36,7 @@ struct ApplePayWebView: UIViewRepresentable {
         #if DEBUG
         if #available(iOS 16.4, *) { webView.isInspectable = true }
         #endif
-        webView.load(URLRequest(url: applePayBase.appending(path: "button/\(orderID)")))
+        webView.load(URLRequest(url: attempt.pageURL))
         return webView
     }
 
@@ -47,12 +46,15 @@ struct ApplePayWebView: UIViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate {
         var onEvent: (ApplePayEvent) -> Void
-        private var reference: String? // this attempt's, from the button page's response
-        private var shown = false       // the button page finished loading
-        private var charging = false    // the page left for Hesabe after the sheet
+        private let attempt: ApplePayAttempt
+        private var shown = false    // the button page finished loading
+        private var charging = false // the page left for Hesabe after the sheet
         private var ended = false
 
-        init(onEvent: @escaping (ApplePayEvent) -> Void) { self.onEvent = onEvent }
+        init(attempt: ApplePayAttempt, onEvent: @escaping (ApplePayEvent) -> Void) {
+            self.attempt = attempt
+            self.onEvent = onEvent
+        }
 
         func webView(_ webView: WKWebView,
                      decidePolicyFor action: WKNavigationAction,
@@ -60,10 +62,10 @@ struct ApplePayWebView: UIViewRepresentable {
             guard action.targetFrame?.isMainFrame != false,
                   let url = action.request.url else { return decisionHandler(.allow) }
 
-            if url.absoluteString.hasPrefix(applePayBase.appending(path: "done/").absoluteString) {
-                end(.finished(url))
+            if url.absoluteString.hasPrefix(attempt.returnURL.absoluteString) {
+                end(.finished(hesabeFinished: true))
                 decisionHandler(.cancel)
-            } else if url.absoluteString.hasPrefix(applePayBase.appending(path: "cancelled").absoluteString) {
+            } else if url.absoluteString.hasPrefix(attempt.cancelURL.absoluteString) {
                 end(.cancelled)
                 decisionHandler(.cancel)
             } else {
@@ -83,9 +85,6 @@ struct ApplePayWebView: UIViewRepresentable {
             guard response.isForMainFrame,
                   let http = response.response as? HTTPURLResponse else { return decisionHandler(.allow) }
 
-            if !shown {
-                reference = http.value(forHTTPHeaderField: "X-Payment-Reference")
-            }
             if http.statusCode >= 400 {
                 loadFailed()
                 decisionHandler(.cancel)
@@ -115,15 +114,9 @@ struct ApplePayWebView: UIViewRepresentable {
             // A newer navigation replacing this one also reports as a failure.
             if let error = error as? URLError, error.code == .cancelled { return }
 
-            if !charging {
-                end(.failed)
-            } else if let reference {
-                // The card may have been charged but Hesabe's redirect never arrived:
-                // ask the done route directly.
-                end(.finished(applePayBase.appending(path: "done/\(reference)")))
-            } else {
-                end(.unconfirmed)
-            }
+            // After the sheet, the card may have been charged even though Hesabe's
+            // redirect never arrived, so ask Hesabe about the attempt.
+            end(charging ? .finished(hesabeFinished: false) : .failed)
         }
 
         private func end(_ event: ApplePayEvent) {

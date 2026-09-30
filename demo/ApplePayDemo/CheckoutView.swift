@@ -2,8 +2,7 @@ import PassKit
 import SwiftUI
 
 struct CheckoutView: View {
-    /// Display only: the backend charges the order's own total.
-    let total = "1.000 KWD"
+    let total = "\(hesabeAmount(checkoutAmount)) KWD"
 
     @State private var outcome: PaymentOutcome?
 
@@ -20,7 +19,7 @@ struct CheckoutView: View {
                     if !PKPaymentAuthorizationController.canMakePayments() {
                         Text("Apple Pay isn't available on this device.")
                     } else if outcome?.canRetry ?? true {
-                        ApplePayButton(orderID: checkoutOrderID) { outcome = $0 }
+                        ApplePayButton(orderID: checkoutOrderID, amount: checkoutAmount) { outcome = $0 }
                             .listRowInsets(EdgeInsets())
                             .listRowBackground(Color.clear)
                     }

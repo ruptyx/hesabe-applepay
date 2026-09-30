@@ -5,7 +5,7 @@ enum PaymentOutcome: Equatable {
     case paid
     /// Declined or rejected. Nothing was charged.
     case failed
-    /// Hesabe is still settling it. Your webhook finishes the order.
+    /// Hesabe is still settling it.
     case pending
     /// The app couldn't find out. The card may have been charged.
     case unconfirmed
@@ -18,31 +18,36 @@ enum PaymentOutcome: Equatable {
         switch self {
         case .paid: "Paid. Thank you!"
         case .failed: "The payment didn't go through. You weren't charged."
-        case .pending: "Your payment is still processing. We'll update your order when it completes."
+        case .pending: "Your payment is still processing. Don't pay again until it completes."
         case .unconfirmed: "We couldn't confirm your payment. Check your order before paying again."
         case .cancelled: "Payment cancelled."
         }
     }
 }
 
-/// The Apple Pay button in a native frame: a spinner while the page loads, a retry button
-/// if it doesn't, and a native "Confirming" state while Hesabe charges the card.
+/// The Apple Pay button in a native frame: a spinner while the session is created and the
+/// page loads, a retry button if either fails, and a native "Confirming" state while Hesabe
+/// charges the card.
 struct ApplePayButton: View {
     let orderID: String
+    let amount: Decimal
     var onOutcome: (PaymentOutcome) -> Void
 
     private enum Phase { case loading, ready, charging, failed }
 
-    @State private var attempt = 0
+    @State private var attempt: ApplePayAttempt?
+    @State private var tries = 0
     @State private var phase = Phase.loading
 
     var body: some View {
         ZStack {
-            ApplePayWebView(orderID: orderID, onEvent: handle)
-                .id(attempt) // new web view = new Hesabe session; each one is single use
-                // Keep the web view loading, but only ever show the button page.
-                .opacity(phase == .ready ? 1 : 0)
-                .allowsHitTesting(phase == .ready)
+            if let attempt {
+                ApplePayWebView(attempt: attempt) { handle($0, in: attempt) }
+                    .id(attempt.id) // a new web view for every attempt
+                    // Keep the web view loading, but only ever show the button page.
+                    .opacity(phase == .ready ? 1 : 0)
+                    .allowsHitTesting(phase == .ready)
+            }
 
             switch phase {
             case .loading:
@@ -53,16 +58,29 @@ struct ApplePayButton: View {
                     Text("Confirming payment…")
                 }
             case .failed:
-                Button("Couldn't load Apple Pay. Try again", action: reload)
+                Button("Couldn't load Apple Pay. Try again", action: retry)
             case .ready:
                 EmptyView()
             }
         }
         .frame(height: 50)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .task(id: tries) { await start() }
     }
 
-    private func handle(_ event: ApplePayEvent) {
+    /// Creates a new Hesabe session. Each one is single use.
+    private func start() async {
+        phase = .loading
+        attempt = nil
+        do {
+            let next = try await ApplePayAttempt.start(orderID: orderID, amount: amount)
+            if !Task.isCancelled { attempt = next }
+        } catch {
+            if !Task.isCancelled { phase = .failed }
+        }
+    }
+
+    private func handle(_ event: ApplePayEvent, in attempt: ApplePayAttempt) {
         switch event {
         case .ready:
             phase = .ready
@@ -72,43 +90,18 @@ struct ApplePayButton: View {
             phase = .failed
         case .cancelled:
             onOutcome(.cancelled)
-            reload()
-        case .unconfirmed:
-            onOutcome(.unconfirmed)
-        case .finished(let doneURL):
+            retry()
+        case .finished(let hesabeFinished):
             phase = .charging
             Task {
-                let outcome = await confirmPayment(at: doneURL)
+                let outcome = await attempt.outcome(hesabeFinished: hesabeFinished)
                 onOutcome(outcome)
-                if outcome.canRetry { reload() }
+                if outcome.canRetry { retry() }
             }
         }
     }
 
-    private func reload() {
-        phase = .loading
-        attempt += 1
+    private func retry() {
+        tries += 1
     }
-}
-
-/// Asks the done route (Step 5) how the attempt ended. A payment still settling reports
-/// "pending", so ask again for a while before handing it to the webhook.
-func confirmPayment(at url: URL) async -> PaymentOutcome {
-    struct Reply: Decodable { let status: String }
-
-    var sawPending = false
-    for attempt in 0..<10 {
-        if attempt > 0 { try? await Task.sleep(for: .seconds(3)) }
-        guard let (data, response) = try? await URLSession.shared.data(from: url),
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              let reply = try? JSONDecoder().decode(Reply.self, from: data)
-        else { continue }
-
-        switch reply.status {
-        case "paid": return .paid
-        case "failed": return .failed
-        default: sawPending = true
-        }
-    }
-    return sawPending ? .pending : .unconfirmed
 }
